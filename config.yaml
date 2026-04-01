@@ -1,0 +1,33 @@
+# BirdCLEF+ 2026 - Configuration
+
+# Data paths
+DATA_DIR: "data"
+TRAIN_AUDIO_DIR: "data/train_audio"
+TEST_SOUNDSCAPES_DIR: "data/test_soundscapes"
+TRAIN_SOUNDSCAPES_DIR: "data/train_soundscapes"
+
+# Files
+TRAIN_CSV: "data/train.csv"
+SAMPLE_SUBMISSION_CSV: "data/sample_submission.csv"
+TAXONOMY_CSV: "data/taxonomy.csv"
+TRAIN_SOUNDSCAPES_LABELS: "data/train_soundscapes_labels.csv"
+
+# Audio parameters
+SAMPLE_RATE: 32000
+N_MELS: 128
+N_FFT: 2048
+HOP_LENGTH: 512
+DURATION: 5
+
+# Training parameters
+BATCH_SIZE: 32
+NUM_WORKERS: 4
+MAX_EPOCHS: 10
+LEARNING_RATE: 0.001
+
+# Model
+NUM_CLASSES: 234
+BACKBONE: "efficientnet_b0"
+
+# Output
+OUTPUT_DIR: "output"
