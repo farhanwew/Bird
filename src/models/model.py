@@ -8,6 +8,9 @@ class BirdClassifier(nn.Module):
         super(BirdClassifier, self).__init__()
         self.num_classes = num_classes
         
+        # Convert 1-channel mel spectrograms to 3-channel for pre-trained backbones
+        self.channel_adapter = nn.Conv2d(1, 3, kernel_size=1, padding=0)
+        
         if backbone == 'efficientnet_b0':
             from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
             self.backbone = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
@@ -30,6 +33,7 @@ class BirdClassifier(nn.Module):
         )
     
     def forward(self, x):
+        x = self.channel_adapter(x)
         features = self.backbone(x)
         logits = self.classifier(features)
         return logits
