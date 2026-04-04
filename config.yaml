@@ -1,16 +1,18 @@
 # BirdCLEF+ 2026 - Configuration
 
-# Data paths
-DATA_DIR: "data"
-TRAIN_AUDIO_DIR: "data/train_audio"
-TEST_SOUNDSCAPES_DIR: "data/test_soundscapes"
-TRAIN_SOUNDSCAPES_DIR: "data/train_soundscapes"
+# Data paths - supports both local and Google Drive
+# For Google Drive: /content/drive/MyDrive/bird-data
+# For local: ./data
+DATA_DIR: "/content/drive/MyDrive/bird-data"
+TRAIN_AUDIO_DIR: "/content/drive/MyDrive/bird-data/train_audio"
+TEST_SOUNDSCAPES_DIR: "/content/drive/MyDrive/bird-data/test_soundscapes"
+TRAIN_SOUNDSCAPES_DIR: "/content/drive/MyDrive/bird-data/train_soundscapes"
 
 # Files
-TRAIN_CSV: "data/train.csv"
-SAMPLE_SUBMISSION_CSV: "data/sample_submission.csv"
-TAXONOMY_CSV: "data/taxonomy.csv"
-TRAIN_SOUNDSCAPES_LABELS: "data/train_soundscapes_labels.csv"
+TRAIN_CSV: "/content/drive/MyDrive/bird-data/train.csv"
+SAMPLE_SUBMISSION_CSV: "/content/drive/MyDrive/bird-data/sample_submission.csv"
+TAXONOMY_CSV: "/content/drive/MyDrive/bird-data/taxonomy.csv"
+TRAIN_SOUNDSCAPES_LABELS: "/content/drive/MyDrive/bird-data/train_soundscapes_labels.csv"
 
 # Audio parameters
 SAMPLE_RATE: 32000
@@ -21,7 +23,7 @@ DURATION: 5
 
 # Training parameters
 BATCH_SIZE: 32
-NUM_WORKERS: 4
+NUM_WORKERS: 2
 MAX_EPOCHS: 10
 LEARNING_RATE: 0.001
 
