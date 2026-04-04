@@ -10,79 +10,134 @@ from src.data.dataset import TestSoundscapeDataset, AudioTransform
 from src.models.model import get_model
 
 
-def predict(model, dataloader, device):
-    model.eval()
-    predictions = []
-    row_ids = []
-    
-    with torch.no_grad():
-        for inputs, rids in tqdm(dataloader, desc="Predicting"):
-            inputs = inputs.to(device)
-            outputs = model(inputs)
-            probs = torch.sigmoid(outputs)
-            
-            predictions.append(probs.cpu().numpy())
-            row_ids.extend(rids)
-    
-    predictions = np.vstack(predictions)
-    return predictions, row_ids
+# ---------------------------------------------------------------------------
+# Predictor backends
+# ---------------------------------------------------------------------------
 
+class TorchPredictor:
+    def __init__(self, model: torch.nn.Module, device: torch.device):
+        self.model = model.to(device)
+        self.device = device
+        self.model.eval()
+
+    def predict_batch(self, inputs_np: np.ndarray) -> np.ndarray:
+        t = torch.from_numpy(inputs_np).to(self.device)
+        with torch.no_grad():
+            logits = self.model(t)
+        return torch.sigmoid(logits).cpu().numpy()
+
+
+class OnnxPredictor:
+    def __init__(self, model_path: str, num_threads: int = 4, providers: list = None):
+        import onnxruntime as ort
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = num_threads
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        self.session = ort.InferenceSession(
+            model_path,
+            sess_options=opts,
+            providers=providers or ['CPUExecutionProvider'],
+        )
+        self.input_name = self.session.get_inputs()[0].name
+
+    def predict_batch(self, inputs_np: np.ndarray) -> np.ndarray:
+        logits = self.session.run(None, {self.input_name: inputs_np.astype(np.float32)})[0]
+        return 1.0 / (1.0 + np.exp(-logits))  # sigmoid
+
+
+# ---------------------------------------------------------------------------
+# Unified inference loop
+# ---------------------------------------------------------------------------
+
+def predict(predictor, dataloader) -> tuple:
+    all_probs, all_row_ids = [], []
+    for inputs, row_ids in tqdm(dataloader, desc="Predicting"):
+        probs = predictor.predict_batch(inputs.numpy())
+        all_probs.append(probs)
+        all_row_ids.extend(row_ids)
+    return np.vstack(all_probs), all_row_ids
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     with open('config.yaml', 'r') as f:
         config = yaml.safe_load(f)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
+
     transform = AudioTransform(
         sample_rate=config['SAMPLE_RATE'],
         n_mels=config['N_MELS'],
         n_fft=config['N_FFT'],
-        hop_length=config['HOP_LENGTH']
+        hop_length=config['HOP_LENGTH'],
+        augment=False,
     )
-    
+
     submission_df = pd.read_csv(config['SAMPLE_SUBMISSION_CSV'])
     label_list = [col for col in submission_df.columns if col != 'row_id']
-    print(f"Number of classes: {len(label_list)}")
-    
+    num_classes = len(label_list)
+    print(f"Classes: {num_classes}")
+
     test_dataset = TestSoundscapeDataset(
         soundscape_dir=config['TEST_SOUNDSCAPES_DIR'],
         sample_submission_path=config['SAMPLE_SUBMISSION_CSV'],
         transform=transform,
-        label_list=label_list
+        label_list=label_list,
     )
-    
+
+    batch_size = config.get('INFERENCE_BATCH_SIZE', config['BATCH_SIZE'])
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config['BATCH_SIZE'],
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=config['NUM_WORKERS'],
-        pin_memory=True
+        num_workers=0,      # 0 workers is safest on Kaggle CPU
+        pin_memory=False,
     )
-    
-    model = get_model(
-        num_classes=config['NUM_CLASSES'],
-        backbone=config.get('BACKBONE', 'simple_cnn'),
-        device=device
-    )
-    
-    checkpoint_path = os.path.join(config['OUTPUT_DIR'], 'final_model.pt')
-    if os.path.exists(checkpoint_path):
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        print(f"Loaded model from {checkpoint_path}")
+    print(f"Test windows: {len(test_dataset)} | Batch size: {batch_size}")
+
+    # Choose backend: ONNX if available and configured, else PyTorch
+    onnx_path = config.get('ONNX_MODEL_PATH', 'output/model.onnx')
+    use_onnx = config.get('USE_ONNX', False) and os.path.exists(onnx_path)
+
+    if use_onnx:
+        print(f"Backend: ONNX  ({onnx_path})")
+        predictor = OnnxPredictor(
+            model_path=onnx_path,
+            num_threads=config.get('ONNX_NUM_THREADS', 4),
+        )
     else:
-        print("Warning: No trained model found, using random weights")
-    
-    predictions, row_ids = predict(model, test_loader, device)
-    
+        if config.get('USE_ONNX', False):
+            print(f"Warning: USE_ONNX=true but {onnx_path} not found. Falling back to PyTorch.")
+        print("Backend: PyTorch CPU")
+        device = torch.device('cpu')
+        model = get_model(
+            num_classes=num_classes,
+            backbone=config.get('BACKBONE', 'simple_cnn'),
+            device=device,
+        )
+        checkpoint_path = None
+        for fname in ('best_model.pt', 'final_model.pt'):
+            candidate = os.path.join(config['OUTPUT_DIR'], fname)
+            if os.path.exists(candidate):
+                checkpoint_path = candidate
+                break
+        if checkpoint_path:
+            model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
+            print(f"Loaded weights from {checkpoint_path}")
+        else:
+            print("Warning: No trained model found, using random weights")
+        predictor = TorchPredictor(model, device)
+
+    predictions, row_ids = predict(predictor, test_loader)
+
     result_df = pd.DataFrame(predictions, columns=label_list)
     result_df.insert(0, 'row_id', row_ids)
-    
+
+    os.makedirs(config['OUTPUT_DIR'], exist_ok=True)
     output_path = os.path.join(config['OUTPUT_DIR'], 'submission.csv')
     result_df.to_csv(output_path, index=False)
-    print(f"Submission saved to {output_path}")
-    print(f"Shape: {result_df.shape}")
+    print(f"Submission saved → {output_path}  shape: {result_df.shape}")
 
 
 if __name__ == '__main__':

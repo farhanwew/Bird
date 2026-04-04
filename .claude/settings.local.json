@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:medium.com)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(grep -E \"\\\\.\\(py|yaml|md\\)$\")",
+      "Bash(wc:*)",
+      "Bash(python -c ':*)"
+    ]
+  }
+}

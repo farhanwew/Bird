@@ -7,3 +7,5 @@ pandas
 tqdm
 pyyaml
 scikit-learn
+onnx
+onnxruntime
