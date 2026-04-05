@@ -6,7 +6,8 @@
       "WebFetch(domain:github.com)",
       "Bash(grep -E \"\\\\.\\(py|yaml|md\\)$\")",
       "Bash(wc:*)",
-      "Bash(python -c ':*)"
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('train.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
     ]
   }
 }

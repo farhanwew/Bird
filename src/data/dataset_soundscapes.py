@@ -6,6 +6,20 @@ import os
 from torch.utils.data import Dataset
 
 
+def _to_seconds(value) -> float:
+    """Convert a time value to seconds. Handles float, int, and 'HH:MM:SS' / 'MM:SS' strings."""
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        parts = str(value).strip().split(':')
+        parts = [float(p) for p in parts]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        return 0.0
+
+
 class TrainSoundscapesDataset(Dataset):
     def __init__(self, soundscape_dir, labels_csv, transform=None, label_list=None):
         self.soundscape_dir = soundscape_dir
@@ -32,15 +46,15 @@ class TrainSoundscapesDataset(Dataset):
         filename = row['filename']
         filepath = os.path.join(self.soundscape_dir, filename)
         
-        start = row.get('start', 0)
-        end = row.get('end', 5)
+        start = _to_seconds(row.get('start', 0))
+        end = _to_seconds(row.get('end', 5))
         
         try:
             audio, sr = librosa.load(filepath, sr=32000, offset=start, duration=end - start)
             if len(audio) < (end - start) * 32000:
                 audio = np.pad(audio, (0, (end - start) * 32000 - len(audio)), mode='constant')
         except Exception:
-            audio = np.zeros((end - start) * 32000)
+            audio = np.zeros(int((end - start) * 32000))
         
         if self.transform:
             mel = self.transform(audio)

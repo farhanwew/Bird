@@ -4,21 +4,23 @@ import torch.nn.functional as F
 
 
 class BirdClassifier(nn.Module):
-    def __init__(self, num_classes=234, backbone='efficientnet_b0'):
+    def __init__(self, num_classes=234, backbone='efficientnet_b0', pretrained=True):
         super(BirdClassifier, self).__init__()
         self.num_classes = num_classes
-        
+
         # Convert 1-channel mel spectrograms to 3-channel for pre-trained backbones
         self.channel_adapter = nn.Conv2d(1, 3, kernel_size=1, padding=0)
-        
+
         if backbone == 'efficientnet_b0':
             from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
-            self.backbone = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
+            weights = EfficientNet_B0_Weights.DEFAULT if pretrained else None
+            self.backbone = efficientnet_b0(weights=weights)
             num_features = self.backbone.classifier[1].in_features
             self.backbone.classifier = nn.Identity()
         elif backbone == 'resnet18':
             from torchvision.models import resnet18, ResNet18_Weights
-            self.backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
+            weights = ResNet18_Weights.DEFAULT if pretrained else None
+            self.backbone = resnet18(weights=weights)
             num_features = self.backbone.fc.in_features
             self.backbone.fc = nn.Identity()
         else:
@@ -80,10 +82,10 @@ class SimpleCNN(nn.Module):
         return x
 
 
-def get_model(num_classes=234, backbone='simple_cnn', device='cpu'):
+def get_model(num_classes=234, backbone='simple_cnn', device='cpu', pretrained=True):
     if backbone == 'simple_cnn':
         model = SimpleCNN(num_classes=num_classes)
     else:
-        model = BirdClassifier(num_classes=num_classes, backbone=backbone)
-    
+        model = BirdClassifier(num_classes=num_classes, backbone=backbone, pretrained=pretrained)
+
     return model.to(device)

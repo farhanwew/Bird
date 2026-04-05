@@ -66,13 +66,16 @@ def validate(model, dataloader, criterion, device):
     all_probs = np.vstack(all_probs)
     all_labels = np.vstack(all_labels)
 
+    # Binarize labels (secondary labels may have value 0.5)
+    binary_labels = (all_labels > 0).astype(np.float32)
+
     # Only score classes that have at least one positive sample in val set
-    valid_cols = all_labels.sum(axis=0) > 0
+    valid_cols = binary_labels.sum(axis=0) > 0
     if valid_cols.sum() == 0:
         roc_auc = 0.0
     else:
         roc_auc = roc_auc_score(
-            all_labels[:, valid_cols],
+            binary_labels[:, valid_cols],
             all_probs[:, valid_cols],
             average='macro',
         )
@@ -148,19 +151,63 @@ def build_combined_dataset(config, train_csv_path, label_list, train_transform):
     return combined, weights
 
 
-def compute_sample_weights(dataset, num_classes):
-    """One-pass class-frequency inversion for WeightedRandomSampler.
+def _extract_labels_from_dataset(dataset, label_to_idx, use_secondary, secondary_weight):
+    """Extract label vectors from dataset metadata (no audio loading)."""
+    from torch.utils.data import ConcatDataset as _ConcatDataset
+
+    if isinstance(dataset, _ConcatDataset):
+        parts = []
+        for ds in dataset.datasets:
+            parts.append(_extract_labels_from_dataset(ds, label_to_idx, use_secondary, secondary_weight))
+        return np.vstack(parts)
+
+    n = len(label_to_idx)
+
+    # TrainAudioDataset
+    if hasattr(dataset, 'df'):
+        df = dataset.df
+        mat = np.zeros((len(df), n), dtype=np.float32)
+        for i, row in enumerate(df.itertuples(index=False)):
+            idx = label_to_idx.get(row.primary_label, None)
+            if idx is not None:
+                mat[i, idx] = 1.0
+            if use_secondary:
+                raw = str(getattr(row, 'secondary_labels', '') or '')
+                raw = raw.strip("[]").replace("'", "").replace('"', '')
+                for sec in raw.split(','):
+                    sec = sec.strip()
+                    if sec and sec in label_to_idx:
+                        mat[i, label_to_idx[sec]] = max(mat[i, label_to_idx[sec]], secondary_weight)
+        return mat
+
+    # TrainSoundscapesDataset
+    if hasattr(dataset, 'labels_df'):
+        df = dataset.labels_df
+        mat = np.zeros((len(df), n), dtype=np.float32)
+        for i, row in enumerate(df.itertuples(index=False)):
+            raw = str(getattr(row, 'primary_label', '') or '')
+            for lbl in raw.split(';'):
+                lbl = lbl.strip()
+                if lbl and lbl in label_to_idx:
+                    mat[i, label_to_idx[lbl]] = 1.0
+        return mat
+
+    # Fallback: unknown dataset type, return uniform weights
+    return np.ones((len(dataset), n), dtype=np.float32)
+
+
+def compute_sample_weights(dataset, label_list, use_secondary=False, secondary_weight=0.5):
+    """Fast class-frequency inversion using DataFrame metadata (no audio loading).
     Each sample gets weight = max(1/class_count) over its active classes.
     """
-    print("Computing sample weights for class balancing...")
-    label_matrix = []
-    for _, label in tqdm(dataset, desc="Scanning labels"):
-        label_matrix.append(label.numpy())
+    print("Computing sample weights for class balancing (fast, no audio loading)...")
+    label_to_idx = {lbl: i for i, lbl in enumerate(label_list)}
+    label_matrix = _extract_labels_from_dataset(dataset, label_to_idx, use_secondary, secondary_weight)
 
-    label_matrix = np.stack(label_matrix)                      # (N, C)
-    class_counts = label_matrix.sum(axis=0) + 1e-6             # (C,)
-    class_weights = 1.0 / class_counts                         # (C,)
-    sample_weights = (label_matrix * class_weights).max(axis=1)  # (N,)
+    class_counts = label_matrix.sum(axis=0) + 1e-6
+    class_weights = 1.0 / class_counts
+    sample_weights = (label_matrix * class_weights).max(axis=1)
+    print(f"  Sample weights computed for {len(sample_weights)} samples across {len(label_list)} classes")
     return sample_weights
 
 
@@ -168,7 +215,13 @@ def main():
     with open('config.yaml', 'r') as f:
         config = yaml.safe_load(f)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
+    if torch.cuda.is_available():
+        try:
+            torch.zeros(1).cuda()
+            device = torch.device('cuda')
+        except Exception as e:
+            print(f"Warning: CUDA available but not usable ({e}), falling back to CPU.")
     print(f"Using device: {device}")
 
     os.makedirs(config['OUTPUT_DIR'], exist_ok=True)
@@ -200,15 +253,28 @@ def main():
     num_classes = len(label_list)
     print(f"Number of classes: {num_classes}")
 
+    # Save label_list so inference.py uses the exact same classes
+    label_list_path = os.path.join(config['OUTPUT_DIR'], 'label_list.json')
+    import json
+    with open(label_list_path, 'w') as f:
+        json.dump(label_list, f)
+    print(f"Label list saved → {label_list_path}")
+
     # Train / val split
     val_frac = config.get('VAL_SPLIT', 0.0)
     seed = config.get('VAL_SEED', 42)
 
     if val_frac > 0:
+        # Stratify by primary_label, but classes with <2 samples can't be stratified.
+        # Replace singleton classes with "__rare__" so sklearn doesn't crash.
+        counts = train_df['primary_label'].value_counts()
+        stratify_col = train_df['primary_label'].where(
+            train_df['primary_label'].map(counts) >= 2, other='__rare__'
+        )
         train_idx, val_idx = train_test_split(
             range(len(train_df)),
             test_size=val_frac,
-            stratify=train_df['primary_label'],
+            stratify=stratify_col,
             random_state=seed,
         )
         train_df_split = train_df.iloc[train_idx].reset_index(drop=True)
@@ -231,7 +297,12 @@ def main():
     print(f"  Total train samples: {len(train_dataset)}")
 
     if config.get('USE_WEIGHTED_SAMPLER', False):
-        weights_arr = compute_sample_weights(train_dataset, num_classes)
+        weights_arr = compute_sample_weights(
+            train_dataset,
+            label_list=label_list,
+            use_secondary=config.get('USE_SECONDARY_LABELS', False),
+            secondary_weight=config.get('SECONDARY_LABEL_WEIGHT', 0.5),
+        )
         sampler = WeightedRandomSampler(
             weights=torch.DoubleTensor(weights_arr),
             num_samples=len(train_dataset),

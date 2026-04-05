@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 import pandas as pd
 import numpy as np
@@ -74,10 +75,21 @@ def main():
         augment=False,
     )
 
-    submission_df = pd.read_csv(config['SAMPLE_SUBMISSION_CSV'])
-    label_list = [col for col in submission_df.columns if col != 'row_id']
+    # Load label_list — priority: label_list.json > TRAIN_CSV > sample_submission
+    label_list_path = os.path.join(config['OUTPUT_DIR'], 'label_list.json')
+    if os.path.exists(label_list_path):
+        with open(label_list_path) as f:
+            label_list = json.load(f)
+        print(f"Loaded label list from {label_list_path} ({len(label_list)} classes)")
+    elif config.get('TRAIN_CSV') and os.path.exists(config['TRAIN_CSV']):
+        train_df = pd.read_csv(config['TRAIN_CSV'])
+        label_list = sorted(train_df['primary_label'].unique().tolist())
+        print(f"Loaded label list from TRAIN_CSV ({len(label_list)} classes)")
+    else:
+        submission_df = pd.read_csv(config['SAMPLE_SUBMISSION_CSV'])
+        label_list = [col for col in submission_df.columns if col != 'row_id']
+        print(f"Warning: using sample_submission columns ({len(label_list)} classes)")
     num_classes = len(label_list)
-    print(f"Classes: {num_classes}")
 
     test_dataset = TestSoundscapeDataset(
         soundscape_dir=config['TEST_SOUNDSCAPES_DIR'],
@@ -123,8 +135,19 @@ def main():
                 checkpoint_path = candidate
                 break
         if checkpoint_path:
-            model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
-            print(f"Loaded weights from {checkpoint_path}")
+            state_dict = torch.load(checkpoint_path, map_location='cpu')
+            # Detect actual num_classes from checkpoint to avoid size mismatch
+            ckpt_classes = state_dict['classifier.4.weight'].shape[0]
+            if ckpt_classes != num_classes:
+                print(f"Note: checkpoint has {ckpt_classes} classes, rebuilding model.")
+                model = get_model(
+                    num_classes=ckpt_classes,
+                    backbone=config.get('BACKBONE', 'simple_cnn'),
+                    device=device,
+                )
+                label_list = label_list[:ckpt_classes]  # safe: TRAIN_CSV is already sorted same way
+            model.load_state_dict(state_dict)
+            print(f"Loaded weights from {checkpoint_path} ({ckpt_classes} classes)")
         else:
             print("Warning: No trained model found, using random weights")
         predictor = TorchPredictor(model, device)
@@ -133,6 +156,14 @@ def main():
 
     result_df = pd.DataFrame(predictions, columns=label_list)
     result_df.insert(0, 'row_id', row_ids)
+
+    # Align to sample_submission format (may have more columns than trained classes)
+    submission_df = pd.read_csv(config['SAMPLE_SUBMISSION_CSV'])
+    submission_cols = [col for col in submission_df.columns if col != 'row_id']
+    for col in submission_cols:
+        if col not in result_df.columns:
+            result_df[col] = 0.0
+    result_df = result_df[['row_id'] + submission_cols]
 
     os.makedirs(config['OUTPUT_DIR'], exist_ok=True)
     output_path = os.path.join(config['OUTPUT_DIR'], 'submission.csv')
