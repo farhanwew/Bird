@@ -16,7 +16,6 @@ import os
 
 import torch
 import yaml
-import pandas as pd
 
 from src.models.model import get_model
 
@@ -77,18 +76,19 @@ def main():
         raise FileNotFoundError(f"No trained model found in {config['OUTPUT_DIR']}. Run train.py first.")
     print(f"Loading weights from {model_path}")
 
-    # Label count from sample_submission
-    submission_df = pd.read_csv(config['SAMPLE_SUBMISSION_CSV'])
-    num_classes = len([c for c in submission_df.columns if c != 'row_id'])
-    print(f"Classes: {num_classes}")
+    # Detect num_classes from checkpoint to avoid size mismatch
+    state_dict = torch.load(model_path, map_location='cpu')
+    num_classes = state_dict['classifier.4.weight'].shape[0]
+    print(f"Classes (from checkpoint): {num_classes}")
 
     # Build model on CPU (ONNX export must be CPU)
     model = get_model(
         num_classes=num_classes,
         backbone=config.get('BACKBONE', 'efficientnet_b0'),
         device=torch.device('cpu'),
+        pretrained=False,
     )
-    model.load_state_dict(torch.load(model_path, map_location='cpu'))
+    model.load_state_dict(state_dict)
 
     time_steps = compute_time_steps(
         config['SAMPLE_RATE'], config.get('DURATION', 5.0), config['HOP_LENGTH']
