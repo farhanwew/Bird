@@ -29,6 +29,7 @@ import pandas as pd
 import yaml
 from pathlib import Path
 from typing import List, Tuple, Optional
+from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
@@ -216,8 +217,9 @@ class PerchExtractor:
         all_sites = []
         all_hours = []
 
-        print(f"Extracting {len(audio_paths)} files...")
-        for i, path in enumerate(audio_paths):
+        skipped = 0
+        pbar = tqdm(audio_paths, desc="Extracting", unit="file")
+        for path in pbar:
             fname = os.path.basename(path)
             stem = os.path.splitext(fname)[0]
             meta = parse_filename_metadata(fname)
@@ -225,7 +227,9 @@ class PerchExtractor:
             try:
                 emb, raw_logits = self.extract_file(path)         # (T, 1536), (T, perch_classes)
             except Exception as e:
-                print(f"  SKIP {fname}: {e}")
+                skipped += 1
+                pbar.set_postfix(skipped=skipped, file=fname[:30])
+                tqdm.write(f"  SKIP {fname}: {e}")
                 continue
 
             # Map Perch logits to competition classes
@@ -242,9 +246,7 @@ class PerchExtractor:
 
             all_emb.append(emb)
             all_scores.append(comp_scores)
-
-            if (i + 1) % 50 == 0 or (i + 1) == len(audio_paths):
-                print(f"  [{i+1}/{len(audio_paths)}] {fname}")
+            pbar.set_postfix(skipped=skipped, windows=len(all_row_ids))
 
         if not all_emb:
             raise RuntimeError(
