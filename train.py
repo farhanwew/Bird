@@ -139,6 +139,10 @@ def build_combined_dataset(config, train_csv_path, label_list, train_transform,
         soundscape_train_df: pre-split soundscape DataFrame (train portion only).
                              If None, uses the full TRAIN_SOUNDSCAPES_LABELS CSV.
     """
+    mel_cache = config.get('MEL_CACHE_DIR', '')
+    audio_mel_cache = os.path.join(mel_cache, 'train_audio') if mel_cache else None
+    sc_mel_cache = os.path.join(mel_cache, 'train_soundscapes') if mel_cache else None
+
     shared_kwargs = dict(
         audio_dir=config['TRAIN_AUDIO_DIR'],
         label_list=label_list,
@@ -146,6 +150,7 @@ def build_combined_dataset(config, train_csv_path, label_list, train_transform,
         secondary_label_weight=config.get('SECONDARY_LABEL_WEIGHT', 0.5),
         duration=config.get('DURATION', 5.0),
         sample_rate=config.get('SAMPLE_RATE', 32000),
+        mel_cache_dir=audio_mel_cache,
     )
 
     audio_dataset = TrainAudioDataset(
@@ -169,6 +174,7 @@ def build_combined_dataset(config, train_csv_path, label_list, train_transform,
             labels_csv=sc_labels_path,
             transform=train_transform,
             label_list=label_list,
+            mel_cache_dir=sc_mel_cache,
         )
         datasets.append(soundscape_dataset)
         oversample = config.get('SOUNDSCAPE_OVERSAMPLE', 1.0)

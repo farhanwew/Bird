@@ -79,6 +79,9 @@ ONNX_MODEL_PATH: "output/model.onnx"
 ONNX_NUM_THREADS: 4
 INFERENCE_BATCH_SIZE: 64
 
+# Mel spectrogram cache (pre-computed .npy files for 5-10x training speedup)
+MEL_CACHE_DIR: "output/mel_cache"   # set to "" to disable; run cache_mel.py to populate
+
 # Backbone freezing (gradual unfreezing)
 FREEZE_EPOCHS: 0             # 0 = no freezing, 3 = freeze backbone for first 3 epochs
 

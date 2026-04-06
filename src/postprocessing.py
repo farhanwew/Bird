@@ -7,7 +7,8 @@ organized in file-contiguous order.
 """
 
 import numpy as np
-from typing import Optional
+import pandas as pd
+from typing import Optional, List
 
 
 class PostProcessor:
@@ -124,6 +125,50 @@ class PostProcessor:
         return out
 
     # ------------------------------------------------------------------
+    # Event vs texture class alpha builder
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def build_class_alphas(
+        taxonomy_csv: str,
+        label_list: List[str],
+        alpha_event: float = 0.15,
+        alpha_texture: float = 0.35,
+    ) -> np.ndarray:
+        """
+        Build per-class smoothing alpha based on taxonomic class.
+
+        Event species (Aves, Mammalia, Reptilia) use alpha_event — shorter,
+        discrete calls benefit from less temporal blending.
+        Texture species (Amphibia, Insecta) use alpha_texture — continuous
+        calls benefit from stronger temporal smoothing.
+
+        Args:
+            taxonomy_csv:  path to taxonomy.csv with primary_label + class_name
+            label_list:    ordered list of competition species labels
+            alpha_event:   smoothing for event species (default 0.15)
+            alpha_texture: smoothing for texture species (default 0.35)
+        Returns:
+            alphas: (n_classes,) float32 array
+        """
+        alphas = np.full(len(label_list), alpha_event, dtype=np.float32)
+        texture_classes = {'Amphibia', 'Insecta'}
+        label_to_idx = {lbl: i for i, lbl in enumerate(label_list)}
+
+        try:
+            tax_df = pd.read_csv(taxonomy_csv)
+            if 'class_name' in tax_df.columns and 'primary_label' in tax_df.columns:
+                for _, row in tax_df.iterrows():
+                    lbl = str(row['primary_label'])
+                    cls = str(row['class_name'])
+                    if lbl in label_to_idx and cls in texture_classes:
+                        alphas[label_to_idx[lbl]] = alpha_texture
+        except Exception:
+            pass
+
+        return alphas
+
+    # ------------------------------------------------------------------
     # Adaptive delta smoothing
     # ------------------------------------------------------------------
 
@@ -131,23 +176,30 @@ class PostProcessor:
         self,
         probs: np.ndarray,
         alpha: float = 0.20,
+        class_alphas: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Temporal smoothing across windows within each file.
-        x'[t] = (1 - alpha) * x[t] + 0.5 * alpha * (x[t-1] + x[t+1])
+        x'[t] = (1 - a) * x[t] + 0.5 * a * (x[t-1] + x[t+1])
 
         Args:
-            probs: (N_files * n_windows, n_classes)
-            alpha: smoothing strength (0 = no smoothing)
+            probs:        (N_files * n_windows, n_classes)
+            alpha:        scalar smoothing strength (overridden by class_alphas)
+            class_alphas: (n_classes,) per-class alpha. When provided, event
+                          species (Aves/Mammalia) get low alpha and texture
+                          species (Amphibia/Insecta) get high alpha.
         Returns:
             smoothed probs
         """
-        if alpha <= 0:
+        if alpha <= 0 and class_alphas is None:
             return probs
 
         N_total = probs.shape[0]
         n_files = N_total // self.n_windows
         out = probs.copy()
+
+        # Per-class alpha broadcast shape: (1, n_classes)
+        a = class_alphas[np.newaxis, :] if class_alphas is not None else alpha
 
         for fi in range(n_files):
             s = fi * self.n_windows
@@ -159,7 +211,7 @@ class PostProcessor:
             for t in range(T):
                 prev = p[t - 1] if t > 0 else p[t]
                 nxt = p[t + 1] if t < T - 1 else p[t]
-                smooth[t] = (1 - alpha) * p[t] + 0.5 * alpha * (prev + nxt)
+                smooth[t] = (1 - a) * p[t] + 0.5 * a * (prev + nxt)
 
             out[s:e] = smooth
 
@@ -203,6 +255,7 @@ class PostProcessor:
         do_rank_scale: bool = True,
         do_smooth: bool = True,
         smooth_alpha: float = 0.20,
+        class_alphas: Optional[np.ndarray] = None,
         rank_power: float = 0.4,
     ) -> np.ndarray:
         """
@@ -212,6 +265,9 @@ class PostProcessor:
             logits:             (N, n_classes) raw logits from ensemble
             class_temperatures: (n_classes,) per-class temperatures
             thresholds:         (n_classes,) per-class thresholds
+            class_alphas:       (n_classes,) per-class smoothing alpha. Build
+                                with PostProcessor.build_class_alphas() using
+                                taxonomy.csv for event vs texture distinction.
         Returns:
             probs: (N, n_classes) final probabilities in [0, 1]
         """
@@ -224,7 +280,7 @@ class PostProcessor:
             probs = self.rank_aware_scaling(probs, power=rank_power)
 
         if do_smooth:
-            probs = self.adaptive_delta_smooth(probs, alpha=smooth_alpha)
+            probs = self.adaptive_delta_smooth(probs, alpha=smooth_alpha, class_alphas=class_alphas)
 
         if thresholds is not None:
             probs = self.apply_thresholds(probs, thresholds)

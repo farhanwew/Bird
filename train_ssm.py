@@ -28,10 +28,11 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import yaml
 from pathlib import Path
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, KFold
 from sklearn.decomposition import PCA
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
@@ -97,22 +98,24 @@ def reshape_to_files(flat: np.ndarray, meta_df: pd.DataFrame, n_windows: int = 1
 
 def train_proto_ssm(
     model: ProtoSSMv5,
-    emb: np.ndarray,           # (N_files, 12, 1536)
-    scores: np.ndarray,        # (N_files, 12, n_classes) Perch logits
-    labels: np.ndarray,        # (N_files, 12, n_classes)
-    site_ids: np.ndarray,      # (N_files,)
-    hours: np.ndarray,         # (N_files,)
+    emb: np.ndarray,                    # (N_files, 12, 1536)
+    scores: np.ndarray,                 # (N_files, 12, n_classes) Perch logits
+    labels: np.ndarray,                 # (N_files, 12, n_classes)
+    site_ids: np.ndarray,               # (N_files,)
+    hours: np.ndarray,                  # (N_files,)
     config: dict,
     device: torch.device,
     val_mask: np.ndarray = None,
+    class_to_family: np.ndarray = None, # (n_classes,) species → family index
 ) -> ProtoSSMv5:
-    """Train ProtoSSMv5 with focal BCE + distillation + SWA."""
+    """Train ProtoSSMv5 with focal BCE + distillation + family aux + SWA."""
     ssm_cfg = config.get('SSM', {})
     n_epochs = ssm_cfg.get('N_EPOCHS', 80)
     lr = ssm_cfg.get('LR', 8e-4)
     wd = ssm_cfg.get('WEIGHT_DECAY', 1e-3)
     patience = ssm_cfg.get('PATIENCE', 20)
     distill_w = ssm_cfg.get('DISTILL_WEIGHT', 0.15)
+    family_w = 0.15
     label_smooth = ssm_cfg.get('LABEL_SMOOTHING', 0.03)
     focal_gamma = ssm_cfg.get('FOCAL_GAMMA', 2.5)
     mixup_alpha = ssm_cfg.get('MIXUP_ALPHA', 0.4)
@@ -120,6 +123,9 @@ def train_proto_ssm(
     swa_start_frac = ssm_cfg.get('SWA_START_FRAC', 0.65)
     swa_lr = ssm_cfg.get('SWA_LR', 4e-4)
     warmup_epochs = 5  # skip mixup for first N epochs
+
+    n_families = (int(class_to_family.max()) + 1) if class_to_family is not None else 0
+    ctf_t = torch.from_numpy(class_to_family).long().to(device) if class_to_family is not None else None
 
     # Split train/val
     if val_mask is None:
@@ -188,7 +194,19 @@ def train_proto_ssm(
             species_logits, torch.sigmoid(s_tr), gamma=focal_gamma
         ) if distill_w > 0 else 0.0
 
-        loss = main_loss + distill_w * distill_loss
+        # Family auxiliary loss — max over windows per file, then per-family presence
+        family_loss = torch.tensor(0.0, device=device)
+        if family_logits is not None and ctf_t is not None and n_families > 0:
+            B_sz = l_tr.shape[0]
+            # Any species active in any window → family present
+            l_any = (l_tr > 0.5).float().max(dim=1).values  # (B, n_classes)
+            fam_labels = torch.zeros(B_sz, n_families, device=device)
+            for c_idx in range(l_any.shape[1]):
+                f_idx = ctf_t[c_idx].item()
+                fam_labels[:, f_idx] = torch.max(fam_labels[:, f_idx], l_any[:, c_idx])
+            family_loss = F.binary_cross_entropy_with_logits(family_logits, fam_labels)
+
+        loss = main_loss + distill_w * distill_loss + family_w * family_loss
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -484,9 +502,12 @@ def main():
     n_files = len(emb_files)
     print(f"Files: {n_files}, Shape: emb={emb_files.shape}, labels={labels_files.shape}")
 
-    # Validation split — 10% of files
+    # Validation split — GroupKFold(5) fold 0 ≈ 20% val, prevents leakage
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    _, val_file_idx = next(iter(kf.split(np.arange(n_files))))
     val_mask = np.zeros(n_files, dtype=bool)
-    val_mask[::10] = True
+    val_mask[val_file_idx] = True
+    print(f"Val split: {val_mask.sum()}/{n_files} files (KFold-5 fold 0)")
 
     # -----------------------------------------------------------------------
     # Step 1: Train ProtoSSMv5
@@ -511,9 +532,27 @@ def main():
     proto_model.init_family_head(n_families)
     print(f"ProtoSSM params: {sum(p.numel() for p in proto_model.parameters()):,}")
 
+    # Prototype initialization from training data hidden states (Task 11)
+    print("Initializing prototypes from training data...")
+    proto_model = proto_model.to(device)
+    proto_model.eval()
+    train_mask = ~val_mask
+    with torch.no_grad():
+        init_emb_t = torch.from_numpy(emb_files[train_mask]).to(device)
+        init_sc_t = torch.from_numpy(scores_files[train_mask]).to(device)
+        init_site_t = torch.from_numpy(site_ids_files[train_mask]).long().to(device)
+        init_hour_t = torch.from_numpy(hours_files[train_mask]).long().to(device)
+        _, _, h_init = proto_model(init_emb_t, init_sc_t, init_site_t, init_hour_t)
+        h_flat = h_init.reshape(-1, h_init.shape[-1])             # (N_train*T, d_model)
+        lab_flat = torch.from_numpy(labels_files[train_mask]).to(device).reshape(-1, n_classes)
+        proto_model.init_prototypes_from_data(h_flat, lab_flat)
+        del init_emb_t, init_sc_t, init_site_t, init_hour_t, h_init, h_flat, lab_flat
+    print("  Prototypes initialized.")
+
     proto_model = train_proto_ssm(
         proto_model, emb_files, scores_files, labels_files,
-        site_ids_files, hours_files, config, device, val_mask
+        site_ids_files, hours_files, config, device, val_mask,
+        class_to_family=class_to_family,
     )
 
     # Save ProtoSSM

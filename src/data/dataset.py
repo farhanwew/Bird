@@ -101,6 +101,7 @@ class TrainAudioDataset(Dataset):
         secondary_label_weight=0.5,
         duration=5.0,
         sample_rate=32000,
+        mel_cache_dir=None,   # if set, read pre-cached .npy instead of loading audio
     ):
         self.df = pd.read_csv(csv_path)
         self.audio_dir = audio_dir
@@ -110,6 +111,7 @@ class TrainAudioDataset(Dataset):
         self.duration = duration
         self.sample_rate = sample_rate
         self.n_samples = int(duration * sample_rate)
+        self.mel_cache_dir = mel_cache_dir
 
         if label_list is None:
             self.label_list = sorted(self.df['primary_label'].unique().tolist())
@@ -117,14 +119,31 @@ class TrainAudioDataset(Dataset):
             self.label_list = label_list
         self.label_to_idx = {label: idx for idx, label in enumerate(self.label_list)}
 
+        if mel_cache_dir:
+            n_cached = sum(
+                1 for fn in self.df['filename']
+                if os.path.exists(os.path.join(mel_cache_dir, str(fn).replace('.ogg', '.npy')))
+            )
+            print(f"  Mel cache: {n_cached}/{len(self.df)} files cached in {mel_cache_dir}")
+
     def __len__(self):
         return len(self.df)
 
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        filename = row['filename']
-        filepath = os.path.join(self.audio_dir, filename)
+    def _load_mel(self, filename):
+        """Load mel from cache (.npy) if available, else compute from audio."""
+        # Try cache first
+        if self.mel_cache_dir:
+            npy_path = os.path.join(self.mel_cache_dir,
+                                    str(filename).replace('.ogg', '.npy'))
+            if os.path.exists(npy_path):
+                mel = np.load(npy_path)
+                # Apply augmentation on top of cached mel if needed
+                if self.transform is not None and self.transform.aug is not None:
+                    mel = self.transform.aug(mel)
+                return mel
 
+        # Fallback: load audio and compute mel
+        filepath = os.path.join(self.audio_dir, filename)
         try:
             audio, _ = librosa.load(filepath, sr=self.sample_rate, duration=self.duration)
             if len(audio) < self.n_samples:
@@ -135,9 +154,12 @@ class TrainAudioDataset(Dataset):
             audio = np.zeros(self.n_samples)
 
         if self.transform:
-            mel = self.transform(audio)
-        else:
-            mel = np.zeros((128, 313))
+            return self.transform(audio)
+        return np.zeros((128, 313))
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        mel = self._load_mel(row['filename'])
 
         label_idx = self.label_to_idx.get(row['primary_label'], 0)
         label = torch.zeros(len(self.label_list))
@@ -145,7 +167,6 @@ class TrainAudioDataset(Dataset):
 
         if self.use_secondary_labels:
             raw = str(row.get('secondary_labels', '') or '')
-            # Format in train.csv: "['abc', 'xyz']" or empty
             raw = raw.strip("[]").replace("'", "").replace('"', '')
             for sec in raw.split(','):
                 sec = sec.strip()

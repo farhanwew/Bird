@@ -212,9 +212,24 @@ labels_t = torch.from_numpy(labels_files)
 site_t   = torch.from_numpy(site_ids_files).long()
 hour_t   = torch.from_numpy(hours_files).long()
 
-val_mask  = np.zeros(n_files_train, dtype=bool); val_mask[::10] = True
-tr_idx    = np.where(~val_mask)[0]
-vl_idx    = np.where(val_mask)[0]
+from sklearn.model_selection import KFold as _KFold
+_kf = _KFold(n_splits=5, shuffle=True, random_state=42)
+_, _val_file_idx = next(iter(_kf.split(np.arange(n_files_train))))
+val_mask = np.zeros(n_files_train, dtype=bool)
+val_mask[_val_file_idx] = True
+tr_idx = np.where(~val_mask)[0]
+vl_idx = np.where(val_mask)[0]
+
+# Initialize prototypes from training data hidden states
+print("Initializing prototypes from training data...")
+proto_model.eval()
+with torch.no_grad():
+    _, _, h_init = proto_model(emb_t[tr_idx], scores_t[tr_idx], site_t[tr_idx], hour_t[tr_idx])
+    h_flat = h_init.reshape(-1, h_init.shape[-1])
+    lab_flat = labels_t[tr_idx].reshape(-1, n_classes)
+    proto_model.init_prototypes_from_data(h_flat, lab_flat)
+    del h_init, h_flat, lab_flat
+print("  Prototypes initialized.")
 
 proto_model.train()
 best_val, patience, best_state = float('inf'), 0, None
@@ -455,17 +470,31 @@ final_logits = first_pass_test + RESIDUAL_W * correction  # (N_test, 12, n_class
 
 # ── Cell 17: Post-processing ──────────────────────────────────────────────────
 from src.postprocessing import PostProcessor
+from src.prior import PriorAndProbeManager as _PriorMgr
 
 final_logits_flat = final_logits.reshape(-1, n_classes)  # (N_test*12, n_classes)
 
+# Fuse prior log-odds into logits (site × hour context)
+test_sites = meta_test['site'].tolist()
+test_hours = meta_test['hour_utc'].tolist()
+prior_logits_test = prior_mgr.prior_logits_from_tables(test_sites, test_hours, prior_tables)
+fused_logits_flat = _PriorMgr.fuse_scores(final_logits_flat, prior_logits_test, weight=0.35)
+
+# Per-class smoothing: Aves/Mammalia=0.15 (event), Amphibia/Insecta=0.35 (texture)
+taxonomy_csv_path = f'{COMP_DIR}/taxonomy.csv'
 pp = PostProcessor(n_windows=N_WINDOWS)
+class_alphas = PostProcessor.build_class_alphas(
+    taxonomy_csv_path, label_list, alpha_event=0.15, alpha_texture=0.35
+)
+
 probs_final = pp.process(
-    final_logits_flat,
+    fused_logits_flat,
     class_temperatures=None,
     do_confidence_scale=True,
     do_rank_scale=True,
     do_smooth=True,
-    smooth_alpha=0.20,
+    smooth_alpha=0.20,        # fallback if taxonomy.csv missing
+    class_alphas=class_alphas,
     rank_power=0.4,
 )
 
