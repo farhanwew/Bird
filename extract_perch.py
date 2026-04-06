@@ -186,6 +186,23 @@ class PerchExtractor:
         logits = out[self._logit_key].numpy().astype(np.float32)    # (T, n_classes)
         return embeddings, logits
 
+    def _infer_batch(self, windows_batch: np.ndarray):
+        """
+        Run SavedModel inference on a stacked batch of windows.
+        Args:
+            windows_batch: (N_total_windows, window_samples)
+        Returns:
+            embeddings: (N_total_windows, 1536)
+            logits:     (N_total_windows, perch_n_classes)
+        """
+        tf = self._tf
+        batch = tf.convert_to_tensor(windows_batch, dtype=tf.float32)
+        out = self._infer(inputs=batch)
+        return (
+            out[self._emb_key].numpy().astype(np.float32),
+            out[self._logit_key].numpy().astype(np.float32),
+        )
+
     def extract_and_cache(
         self,
         audio_paths: List[str],
@@ -193,6 +210,7 @@ class PerchExtractor:
         label_list: List[str],
         taxonomy_csv: Optional[str] = None,
         perch_label_csv: Optional[str] = None,
+        batch_files: int = 16,
     ) -> None:
         """
         Extract all files, map Perch logits to competition classes, save cache.
@@ -203,6 +221,7 @@ class PerchExtractor:
             label_list    : competition label list (234 species)
             taxonomy_csv  : path to taxonomy.csv for class mapping
             perch_label_csv : path to Perch's labels.csv (981 classes)
+            batch_files   : files per SavedModel call (ignored for hoplite backend)
         """
         os.makedirs(cache_dir, exist_ok=True)
 
@@ -217,36 +236,94 @@ class PerchExtractor:
         all_sites = []
         all_hours = []
 
+        # hoplite processes windows one at a time internally; no cross-file batching needed
+        use_batching = (self._backend == 'tf_savedmodel') and (batch_files > 1)
+
         skipped = 0
-        pbar = tqdm(audio_paths, desc="Extracting", unit="file")
-        for path in pbar:
+        pbar = tqdm(total=len(audio_paths), desc="Extracting", unit="file")
+
+        i = 0
+        while i < len(audio_paths):
+            # ----------------------------------------------------------------
+            # Batched SavedModel path: load N files, run one _infer() call
+            # ----------------------------------------------------------------
+            if use_batching:
+                chunk = audio_paths[i: i + batch_files]
+                windows_list, metas, valid_paths = [], [], []
+
+                for path in chunk:
+                    try:
+                        audio = self._load_audio(path)
+                        windows_list.append(audio.reshape(self.n_windows, self.window_samples))
+                        metas.append((path, parse_filename_metadata(os.path.basename(path))))
+                        valid_paths.append(path)
+                    except Exception as e:
+                        skipped += 1
+                        tqdm.write(f"  SKIP (load) {os.path.basename(path)}: {e}")
+
+                if windows_list:
+                    try:
+                        stacked = np.vstack(windows_list)          # (N_files*12, samples)
+                        emb_all, logit_all = self._infer_batch(stacked)
+                    except Exception as e:
+                        skipped += len(windows_list)
+                        tqdm.write(f"  SKIP batch of {len(windows_list)} files: {e}")
+                        i += len(chunk)
+                        pbar.update(len(chunk))
+                        pbar.set_postfix(skipped=skipped, windows=len(all_row_ids))
+                        continue
+
+                    for j, (path, meta) in enumerate(metas):
+                        fname = os.path.basename(path)
+                        stem = os.path.splitext(fname)[0]
+                        emb = emb_all[j * self.n_windows: (j + 1) * self.n_windows]
+                        raw_logits = logit_all[j * self.n_windows: (j + 1) * self.n_windows]
+                        comp_scores = _map_logits(raw_logits, perch_to_comp, n_comp)
+                        for t in range(self.n_windows):
+                            all_row_ids.append(f"{stem}_{(t + 1) * self.window_sec}")
+                            all_filenames.append(fname)
+                            all_sites.append(meta['site'])
+                            all_hours.append(meta['hour_utc'])
+                        all_emb.append(emb)
+                        all_scores.append(comp_scores)
+
+                i += len(chunk)
+                pbar.update(len(chunk))
+                pbar.set_postfix(skipped=skipped, windows=len(all_row_ids))
+                continue
+
+            # ----------------------------------------------------------------
+            # Per-file path (hoplite backend or batch_files=1)
+            # ----------------------------------------------------------------
+            path = audio_paths[i]
             fname = os.path.basename(path)
             stem = os.path.splitext(fname)[0]
             meta = parse_filename_metadata(fname)
 
             try:
-                emb, raw_logits = self.extract_file(path)         # (T, 1536), (T, perch_classes)
+                emb, raw_logits = self.extract_file(path)
             except Exception as e:
                 skipped += 1
-                pbar.set_postfix(skipped=skipped, file=fname[:30])
                 tqdm.write(f"  SKIP {fname}: {e}")
+                i += 1
+                pbar.update(1)
+                pbar.set_postfix(skipped=skipped, windows=len(all_row_ids))
                 continue
 
-            # Map Perch logits to competition classes
-            comp_scores = _map_logits(raw_logits, perch_to_comp, n_comp)  # (T, n_comp)
-
-            T = emb.shape[0]
-            for t in range(T):
-                end_sec = (t + 1) * self.window_sec
-                row_id = f"{stem}_{end_sec}"
-                all_row_ids.append(row_id)
+            comp_scores = _map_logits(raw_logits, perch_to_comp, n_comp)
+            for t in range(self.n_windows):
+                all_row_ids.append(f"{stem}_{(t + 1) * self.window_sec}")
                 all_filenames.append(fname)
                 all_sites.append(meta['site'])
                 all_hours.append(meta['hour_utc'])
-
             all_emb.append(emb)
             all_scores.append(comp_scores)
+
+            i += 1
+            pbar.update(1)
             pbar.set_postfix(skipped=skipped, windows=len(all_row_ids))
+
+        pbar.close()
 
         if not all_emb:
             raise RuntimeError(
@@ -372,14 +449,15 @@ def main():
         audio_paths = audio_paths[:args.limit]
     print(f"Found {len(audio_paths)} .ogg files in {audio_dir}")
 
-    # Load label list
+    # Load label list — always prefer sample_submission.csv (234 classes).
+    # train.csv only has 206 classes; the remaining 28 appear only in soundscapes.
     label_list_path = os.path.join(config.get('OUTPUT_DIR', 'output'), 'label_list.json')
-    if os.path.exists(label_list_path):
+    if os.path.exists(config.get('SAMPLE_SUBMISSION_CSV', '')):
+        sub_df = pd.read_csv(config['SAMPLE_SUBMISSION_CSV'])
+        label_list = [c for c in sub_df.columns if c != 'row_id']
+    elif os.path.exists(label_list_path):
         with open(label_list_path) as f:
             label_list = json.load(f)
-    elif os.path.exists(config.get('TRAIN_CSV', '')):
-        train_df = pd.read_csv(config['TRAIN_CSV'])
-        label_list = sorted(train_df['primary_label'].unique().tolist())
     else:
         sub_df = pd.read_csv(config['SAMPLE_SUBMISSION_CSV'])
         label_list = [c for c in sub_df.columns if c != 'row_id']
@@ -396,6 +474,7 @@ def main():
         audio_paths=audio_paths,
         cache_dir=cache_dir,
         label_list=label_list,
+        batch_files=perch_cfg.get('BATCH_FILES', 16),
     )
     print("Done.")
 
