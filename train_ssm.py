@@ -40,6 +40,7 @@ from tqdm import tqdm
 
 from src.models.ssm import ProtoSSMv5, ResidualSSM
 from src.taxonomy import TaxonomyManager
+from src.prior import PriorAndProbeManager
 from src.training_utils import (
     focal_bce_with_logits, build_pos_weights, mixup_files
 )
@@ -646,9 +647,25 @@ def main():
     with open(os.path.join(output_dir, 'ssm_meta.json'), 'w') as f:
         json.dump(meta_info, f, indent=2)
 
+    # -----------------------------------------------------------------------
+    # Save prior tables (site × hour priors — needed for inference)
+    # -----------------------------------------------------------------------
+    print("\n=== Fitting prior tables ===")
+    prior_mgr = PriorAndProbeManager(label_list)
+    prior_tables = prior_mgr.fit_prior_tables(meta_df, labels_flat)
+    prior_path = os.path.join(output_dir, 'prior_tables.pkl')
+    with open(prior_path, 'wb') as f:
+        pickle.dump({'prior_tables': prior_tables, 'label_list': label_list}, f)
+    print(f"Saved prior tables → {prior_path}")
+
     print(f"\nAll SSM artifacts saved to {output_dir}/")
-    print("Next: python extract_perch.py --source test_soundscapes")
-    print("      Then submit kaggle_inference_ssm.py to Kaggle")
+    print("Files to upload as Kaggle dataset:")
+    for fname in ['proto_ssm.pt', 'residual_ssm.pt', 'mlp_probes.pkl',
+                  'prior_tables.pkl', 'ssm_meta.json']:
+        fpath = os.path.join(output_dir, fname)
+        if os.path.exists(fpath):
+            size_mb = os.path.getsize(fpath) / 1e6
+            print(f"  {fname}  ({size_mb:.1f} MB)")
 
 
 if __name__ == '__main__':

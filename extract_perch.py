@@ -116,6 +116,10 @@ class PerchExtractor:
                 "Fix: pip install perch-hoplite  OR  pip install tensorflow-cpu==2.20.0"
             )
 
+        # Use all available CPU cores for TF ops — critical for CPU-only inference speed
+        tf.config.threading.set_inter_op_parallelism_threads(0)
+        tf.config.threading.set_intra_op_parallelism_threads(0)
+
         if not model_dir:
             raise ValueError(
                 "Set PERCH.MODEL_DIR in config.yaml to the Perch TF SavedModel path.\n"
@@ -211,17 +215,21 @@ class PerchExtractor:
         taxonomy_csv: Optional[str] = None,
         perch_label_csv: Optional[str] = None,
         batch_files: int = 16,
+        resume: bool = False,
+        checkpoint_every: int = 500,
     ) -> None:
         """
         Extract all files, map Perch logits to competition classes, save cache.
 
         Args:
-            audio_paths   : list of .ogg file paths
-            cache_dir     : output directory
-            label_list    : competition label list (234 species)
-            taxonomy_csv  : path to taxonomy.csv for class mapping
-            perch_label_csv : path to Perch's labels.csv (981 classes)
-            batch_files   : files per SavedModel call (ignored for hoplite backend)
+            audio_paths      : list of .ogg file paths
+            cache_dir        : output directory
+            label_list       : competition label list (234 species)
+            taxonomy_csv     : path to taxonomy.csv for class mapping
+            perch_label_csv  : path to Perch's labels.csv (981 classes)
+            batch_files      : files per SavedModel call (ignored for hoplite backend)
+            resume           : if True, skip files already in checkpoint and append
+            checkpoint_every : save partial results every N processed files
         """
         os.makedirs(cache_dir, exist_ok=True)
 
@@ -229,12 +237,31 @@ class PerchExtractor:
         perch_to_comp = _build_class_mapping(label_list, taxonomy_csv, perch_label_csv)
         n_comp = len(label_list)
 
-        all_emb = []
-        all_scores = []
-        all_row_ids = []
-        all_filenames = []
-        all_sites = []
-        all_hours = []
+        all_emb: list = []
+        all_scores: list = []
+        all_row_ids: list = []
+        all_filenames: list = []
+        all_sites: list = []
+        all_hours: list = []
+
+        # Resume: load existing checkpoint and skip already-done files
+        done_files: set = set()
+        arrays_path = os.path.join(cache_dir, 'perch_arrays.npz')
+        meta_path   = os.path.join(cache_dir, 'perch_meta.parquet')
+        if resume and os.path.exists(arrays_path) and os.path.exists(meta_path):
+            print("Resuming from checkpoint...")
+            ckpt = np.load(arrays_path)
+            ckpt_meta = pd.read_parquet(meta_path)
+            all_emb    = list(ckpt['emb_full'].reshape(-1, self.n_windows, 1536))
+            all_scores = list(ckpt['scores_full_raw'].reshape(-1, self.n_windows, n_comp))
+            all_row_ids   = ckpt_meta['row_id'].tolist()
+            all_filenames = ckpt_meta['filename'].tolist()
+            all_sites     = ckpt_meta['site'].tolist()
+            all_hours     = ckpt_meta['hour_utc'].tolist()
+            done_files = set(ckpt_meta['filename'].unique())
+            print(f"  Loaded {len(done_files)} files from checkpoint, resuming...")
+
+        audio_paths = [p for p in audio_paths if os.path.basename(p) not in done_files]
 
         # hoplite processes windows one at a time internally; no cross-file batching needed
         use_batching = (self._backend == 'tf_savedmodel') and (batch_files > 1)
@@ -290,6 +317,9 @@ class PerchExtractor:
                 i += len(chunk)
                 pbar.update(len(chunk))
                 pbar.set_postfix(skipped=skipped, windows=len(all_row_ids))
+                _maybe_checkpoint(all_emb, all_scores, all_row_ids, all_filenames,
+                                  all_sites, all_hours, arrays_path, meta_path,
+                                  checkpoint_every, self.n_windows, n_comp)
                 continue
 
             # ----------------------------------------------------------------
@@ -322,6 +352,9 @@ class PerchExtractor:
             i += 1
             pbar.update(1)
             pbar.set_postfix(skipped=skipped, windows=len(all_row_ids))
+            _maybe_checkpoint(all_emb, all_scores, all_row_ids, all_filenames,
+                              all_sites, all_hours, arrays_path, meta_path,
+                              checkpoint_every, self.n_windows, n_comp)
 
         pbar.close()
 
@@ -407,6 +440,27 @@ def _map_logits(
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint helper
+# ---------------------------------------------------------------------------
+
+def _maybe_checkpoint(all_emb, all_scores, all_row_ids, all_filenames,
+                      all_sites, all_hours, arrays_path, meta_path,
+                      checkpoint_every, n_windows, n_comp):
+    """Save partial results every checkpoint_every files."""
+    n_files = len(all_emb)
+    if n_files == 0 or n_files % checkpoint_every != 0:
+        return
+    emb_full    = np.vstack(all_emb).astype(np.float32)
+    scores_full = np.vstack(all_scores).astype(np.float32)
+    np.savez_compressed(arrays_path, emb_full=emb_full, scores_full_raw=scores_full)
+    pd.DataFrame({
+        'row_id': all_row_ids, 'filename': all_filenames,
+        'site': all_sites, 'hour_utc': all_hours,
+    }).to_parquet(meta_path, index=False)
+    tqdm.write(f"  [checkpoint] saved {n_files} files → {arrays_path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -420,6 +474,12 @@ def main():
         help="Which audio source to process.",
     )
     parser.add_argument('--limit', type=int, default=None, help="Process only first N files (for testing).")
+    parser.add_argument('--shard', type=str, default=None,
+                        help="Process a fraction of files, e.g. '0/3' = first third, '1/3' = second third.")
+    parser.add_argument('--resume', action='store_true',
+                        help="Skip files already saved in checkpoint; append new results.")
+    parser.add_argument('--checkpoint-every', type=int, default=500,
+                        help="Save partial results every N files (default 500).")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -447,7 +507,15 @@ def main():
     audio_paths = [str(p) for p in audio_paths]
     if args.limit:
         audio_paths = audio_paths[:args.limit]
-    print(f"Found {len(audio_paths)} .ogg files in {audio_dir}")
+
+    # Shard: split work across multiple notebook instances
+    # e.g. --shard 0/3 --shard 1/3 --shard 2/3 in three separate notebooks
+    if args.shard:
+        shard_idx, n_shards = (int(x) for x in args.shard.split('/'))
+        audio_paths = audio_paths[shard_idx::n_shards]
+        print(f"Shard {shard_idx}/{n_shards}: processing {len(audio_paths)} files")
+    else:
+        print(f"Found {len(audio_paths)} .ogg files in {audio_dir}")
 
     # Load label list — always prefer sample_submission.csv (234 classes).
     # train.csv only has 206 classes; the remaining 28 appear only in soundscapes.
@@ -475,6 +543,8 @@ def main():
         cache_dir=cache_dir,
         label_list=label_list,
         batch_files=perch_cfg.get('BATCH_FILES', 16),
+        resume=args.resume,
+        checkpoint_every=args.checkpoint_every,
     )
     print("Done.")
 
