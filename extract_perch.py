@@ -21,6 +21,8 @@ import os
 # Disable XLA JIT to avoid StableHLO version mismatch with Perch v2 SavedModel
 os.environ.setdefault('TF_XLA_FLAGS', '--tf_xla_auto_jit=0')
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')   # suppress TF C++ warnings
+os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')  # suppress oneDNN warnings
+os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '0')   # suppress cuda_timer warnings
 
 import re
 import json
@@ -115,6 +117,11 @@ class PerchExtractor:
                 "Neither perch-hoplite nor tensorflow>=2.20.0 is available.\n"
                 "Fix: pip install perch-hoplite  OR  pip install tensorflow-cpu==2.20.0"
             )
+
+        # Suppress verbose TF/CUDA logging (cuda_timer warnings etc.)
+        tf.get_logger().setLevel('ERROR')
+        import logging
+        logging.getLogger('tensorflow').setLevel(logging.ERROR)
 
         # Use all available CPU cores for TF ops — critical for CPU-only inference speed
         tf.config.threading.set_inter_op_parallelism_threads(0)
