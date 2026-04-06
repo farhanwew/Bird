@@ -17,6 +17,11 @@ Usage:
 
 import argparse
 import os
+
+# Disable XLA JIT to avoid StableHLO version mismatch with Perch v2 SavedModel
+os.environ.setdefault('TF_XLA_FLAGS', '--tf_xla_auto_jit=0')
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')   # suppress TF C++ warnings
+
 import re
 import json
 import numpy as np
