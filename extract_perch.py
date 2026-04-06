@@ -61,12 +61,16 @@ def parse_filename_metadata(fname: str) -> dict:
 
 class PerchExtractor:
     """
-    Loads Google Perch TF SavedModel and extracts per-window embeddings.
+    Loads Google Perch v2 and extracts per-window embeddings.
+
+    Supports two backends (tried in order):
+      1. perch-hoplite  — official high-level API (pip install perch-hoplite)
+      2. raw TF SavedModel — requires tensorflow >= 2.20.0
 
     Each audio file is split into N_WINDOWS × WINDOW_SEC segments.
     Output per file:
       embeddings : (N_WINDOWS, 1536) float32
-      logits     : (N_WINDOWS, perch_n_classes) float32
+      logits     : (N_WINDOWS, perch_n_classes) float32  [14795 for Perch v2]
     """
 
     def __init__(
@@ -76,40 +80,55 @@ class PerchExtractor:
         window_sec: int = 5,
         n_windows: int = 12,
     ):
-        try:
-            import tensorflow as tf
-            self._tf = tf
-        except ImportError:
-            raise ImportError(
-                "tensorflow is required for Perch extraction. "
-                "Install with: pip install tensorflow"
-            )
-
-        print(f"Loading Perch from {model_dir} ...")
-        self._model = tf.saved_model.load(model_dir)
-        self._infer = self._model.signatures["serving_default"]
         self.sample_rate = sample_rate
         self.window_sec = window_sec
         self.n_windows = n_windows
         self.window_samples = sample_rate * window_sec
         self.total_samples = self.window_samples * n_windows
-        print("Perch loaded.")
+        self._backend = None
+
+        # Try perch-hoplite first (official API, no StableHLO issues)
+        try:
+            from perch_hoplite.zoo import model_configs as _mc
+            print("Loading Perch via perch-hoplite API...")
+            self._hoplite_model = _mc.load_model_by_name('perch_v2')
+            self._backend = 'hoplite'
+            print("Perch loaded (hoplite backend).")
+            return
+        except Exception as e:
+            print(f"perch-hoplite not available ({e}), falling back to raw SavedModel...")
+
+        # Fallback: raw TF SavedModel (needs TF >= 2.20.0)
+        try:
+            import tensorflow as tf
+            self._tf = tf
+        except ImportError:
+            raise ImportError("Install tensorflow>=2.20.0 or perch-hoplite: pip install perch-hoplite")
+
+        print(f"Loading Perch from {model_dir} ...")
+        self._model = tf.saved_model.load(model_dir)
+        self._infer = self._model.signatures["serving_default"]
+        self._backend = 'tf_savedmodel'
+        # Detect output key names from the signature
+        self._emb_key = 'embedding' if 'embedding' in self._infer.structured_outputs else \
+                        next(k for k in self._infer.structured_outputs if 'emb' in k.lower())
+        self._logit_key = 'label' if 'label' in self._infer.structured_outputs else \
+                          next(k for k in self._infer.structured_outputs if 'label' in k.lower()
+                               or 'logit' in k.lower())
+        print(f"Perch loaded (SavedModel backend). Keys: emb='{self._emb_key}', logit='{self._logit_key}'")
 
     def _load_audio(self, path: str) -> np.ndarray:
-        """Load audio, resample to target SR, pad/trim to total_samples."""
+        """Load audio, resample to 32 kHz mono, pad/trim to total_samples."""
         try:
             import soundfile as sf
             audio, sr = sf.read(path, dtype='float32')
-        except ImportError:
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+        except Exception:
             import librosa
             audio, sr = librosa.load(path, sr=self.sample_rate, mono=True)
             return _pad_trim(audio, self.total_samples)
 
-        # Convert to mono
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-
-        # Resample if needed
         if sr != self.sample_rate:
             import librosa
             audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sample_rate)
@@ -121,17 +140,28 @@ class PerchExtractor:
         Extract embeddings and raw logits from a single audio file.
         Returns:
             embeddings : (n_windows, 1536)
-            logits     : (n_windows, perch_n_classes)
+            logits     : (n_windows, perch_n_classes)  — 14795 for Perch v2
         """
-        tf = self._tf
         audio = self._load_audio(path)
-        windows = audio.reshape(self.n_windows, self.window_samples)  # (T, window_samples)
 
+        if self._backend == 'hoplite':
+            # perch-hoplite processes one 5s window at a time
+            windows = audio.reshape(self.n_windows, self.window_samples)
+            emb_list, logit_list = [], []
+            for w in windows:
+                out = self._hoplite_model.embed(w)
+                emb_list.append(out.embeddings)        # (1536,)
+                logit_list.append(out.logits['label']) # (n_classes,)
+            return np.stack(emb_list), np.stack(logit_list)
+
+        # Raw SavedModel backend
+        tf = self._tf
+        windows = audio.reshape(self.n_windows, self.window_samples)
         batch = tf.convert_to_tensor(windows, dtype=tf.float32)
         out = self._infer(inputs=batch)
 
-        embeddings = out['embedding'].numpy().astype(np.float32)   # (T, 1536)
-        logits = out['label'].numpy().astype(np.float32)           # (T, perch_classes)
+        embeddings = out[self._emb_key].numpy().astype(np.float32)  # (T, 1536)
+        logits = out[self._logit_key].numpy().astype(np.float32)    # (T, n_classes)
         return embeddings, logits
 
     def extract_and_cache(
