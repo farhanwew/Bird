@@ -8,7 +8,8 @@
       "Bash(wc:*)",
       "Bash(python -c ':*)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('train.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python extract_perch.py --source train_soundscapes)"
     ]
   }
 }

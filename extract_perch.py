@@ -91,7 +91,14 @@ class PerchExtractor:
         try:
             from perch_hoplite.zoo import model_configs as _mc
             print("Loading Perch via perch-hoplite API...")
-            self._hoplite_model = _mc.load_model_by_name('perch_v2')
+            # Correct API: get_model_class + from_config (load_model_by_name does not exist)
+            model_class = _mc.get_model_class('taxonomy_model_tf')
+            self._hoplite_model = model_class.from_config({
+                'model_path': model_dir,
+                'window_size_s': float(window_sec),
+                'hop_size_s': float(window_sec),
+                'sample_rate': sample_rate,
+            })
             self._backend = 'hoplite'
             print("Perch loaded (hoplite backend).")
             return
@@ -103,7 +110,16 @@ class PerchExtractor:
             import tensorflow as tf
             self._tf = tf
         except ImportError:
-            raise ImportError("Install tensorflow>=2.20.0 or perch-hoplite: pip install perch-hoplite")
+            raise ImportError(
+                "Neither perch-hoplite nor tensorflow>=2.20.0 is available.\n"
+                "Fix: pip install perch-hoplite  OR  pip install tensorflow-cpu==2.20.0"
+            )
+
+        if not model_dir:
+            raise ValueError(
+                "Set PERCH.MODEL_DIR in config.yaml to the Perch TF SavedModel path.\n"
+                "On Kaggle, e.g.: /kaggle/input/birdclef2026-perch-model/perch_v2_cpu/1"
+            )
 
         print(f"Loading Perch from {model_dir} ...")
         self._model = tf.saved_model.load(model_dir)
@@ -145,13 +161,18 @@ class PerchExtractor:
         audio = self._load_audio(path)
 
         if self._backend == 'hoplite':
-            # perch-hoplite processes one 5s window at a time
+            # perch-hoplite processes one 5s window at a time.
+            # embed() returns ModelOutput with .embeddings shape (frames, 1536)
+            # and .logits['label'] shape (frames, n_classes) — frames=1 for a 5s input.
             windows = audio.reshape(self.n_windows, self.window_samples)
             emb_list, logit_list = [], []
             for w in windows:
                 out = self._hoplite_model.embed(w)
-                emb_list.append(out.embeddings)        # (1536,)
-                logit_list.append(out.logits['label']) # (n_classes,)
+                emb = np.array(out.embeddings)          # (1, 1536) or (1536,)
+                logit = np.array(out.logits['label'])   # (1, n_classes) or (n_classes,)
+                # Squeeze leading frames dimension if present
+                emb_list.append(emb[0] if emb.ndim > 1 else emb)
+                logit_list.append(logit[0] if logit.ndim > 1 else logit)
             return np.stack(emb_list), np.stack(logit_list)
 
         # Raw SavedModel backend
@@ -224,6 +245,13 @@ class PerchExtractor:
 
             if (i + 1) % 50 == 0 or (i + 1) == len(audio_paths):
                 print(f"  [{i+1}/{len(audio_paths)}] {fname}")
+
+        if not all_emb:
+            raise RuntimeError(
+                "All files failed to process. "
+                "Most likely cause: TF version too old for this Perch model.\n"
+                "Fix: pip install tensorflow-cpu==2.20.0  (then restart kernel)"
+            )
 
         emb_full = np.vstack(all_emb).astype(np.float32)          # (N, 1536)
         scores_full = np.vstack(all_scores).astype(np.float32)    # (N, n_comp)
@@ -320,8 +348,8 @@ def main():
 
     perch_cfg = config.get('PERCH', {})
     model_dir = perch_cfg.get('MODEL_DIR', '')
-    if not model_dir:
-        raise ValueError("Set PERCH.MODEL_DIR in config.yaml to the Perch TF SavedModel path.")
+    # Note: model_dir is needed for both backends (hoplite uses it as model_path;
+    # SavedModel backend loads it directly). Only raise after construction fails.
 
     cache_dir = perch_cfg.get('CACHE_DIR', 'output/perch_cache')
     cache_dir = os.path.join(cache_dir, args.source)
