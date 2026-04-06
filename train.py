@@ -1,6 +1,8 @@
 import os
+import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, ConcatDataset, WeightedRandomSampler
 from sklearn.model_selection import train_test_split
@@ -14,6 +16,16 @@ import yaml
 from src.data.dataset import TrainAudioDataset, AudioTransform
 from src.data.dataset_soundscapes import TrainSoundscapesDataset
 from src.models.model import get_model
+
+
+def focal_bce_with_logits(logits, targets, gamma=2.0, reduction="mean"):
+    """Focal loss for multi-label classification. Down-weights easy examples."""
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p = torch.sigmoid(logits)
+    pt = targets * p + (1 - targets) * (1 - p)
+    focal_weight = (1 - pt) ** gamma
+    loss = focal_weight * bce
+    return loss.mean() if reduction == "mean" else loss
 
 
 def mixup_batch(inputs, labels, alpha):
@@ -100,9 +112,32 @@ def build_scheduler(optimizer, config):
     return optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.5)
 
 
-def build_combined_dataset(config, train_csv_path, label_list, train_transform):
+def split_soundscapes_by_file(labels_csv, val_frac=0.15, seed=42):
+    """
+    Split train_soundscapes_labels.csv into train/val by filename.
+    Splitting by filename (not by row) prevents data leakage — windows
+    from the same recording stay in the same split.
+    Returns (train_df, val_df).
+    """
+    df = pd.read_csv(labels_csv)
+    unique_files = df['filename'].unique()
+    np.random.seed(seed)
+    np.random.shuffle(unique_files)
+    n_val = max(1, int(len(unique_files) * val_frac))
+    val_files = set(unique_files[:n_val])
+    train_df = df[~df['filename'].isin(val_files)].reset_index(drop=True)
+    val_df   = df[df['filename'].isin(val_files)].reset_index(drop=True)
+    return train_df, val_df
+
+
+def build_combined_dataset(config, train_csv_path, label_list, train_transform,
+                           soundscape_train_df=None):
     """Combines TrainAudioDataset + optionally TrainSoundscapesDataset.
     Returns (dataset, per_sample_weights).
+
+    Args:
+        soundscape_train_df: pre-split soundscape DataFrame (train portion only).
+                             If None, uses the full TRAIN_SOUNDSCAPES_LABELS CSV.
     """
     shared_kwargs = dict(
         audio_dir=config['TRAIN_AUDIO_DIR'],
@@ -121,9 +156,17 @@ def build_combined_dataset(config, train_csv_path, label_list, train_transform):
     weights = [1.0] * len(audio_dataset)
 
     if config.get('USE_TRAIN_SOUNDSCAPES', False):
+        # Use pre-split train portion if provided, else full CSV
+        if soundscape_train_df is not None:
+            tmp_path = os.path.join(config['OUTPUT_DIR'], '_soundscape_train_split.csv')
+            soundscape_train_df.to_csv(tmp_path, index=False)
+            sc_labels_path = tmp_path
+        else:
+            sc_labels_path = config['TRAIN_SOUNDSCAPES_LABELS']
+
         soundscape_dataset = TrainSoundscapesDataset(
             soundscape_dir=config['TRAIN_SOUNDSCAPES_DIR'],
-            labels_csv=config['TRAIN_SOUNDSCAPES_LABELS'],
+            labels_csv=sc_labels_path,
             transform=train_transform,
             label_list=label_list,
         )
@@ -212,8 +255,37 @@ def compute_sample_weights(dataset, label_list, use_secondary=False, secondary_w
 
 
 def main():
-    with open('config.yaml', 'r') as f:
+    parser = argparse.ArgumentParser(description="Train BirdCLEF model.")
+    parser.add_argument('--config', default='config.yaml', help="Path to config YAML.")
+    # Common overrides
+    parser.add_argument('--backbone',       type=str,   help="BACKBONE override")
+    parser.add_argument('--epochs',         type=int,   help="MAX_EPOCHS override")
+    parser.add_argument('--lr',             type=float, help="LEARNING_RATE override")
+    parser.add_argument('--batch-size',     type=int,   help="BATCH_SIZE override")
+    parser.add_argument('--loss',           type=str,   choices=['bce', 'focal_bce'], help="LOSS override")
+    parser.add_argument('--freeze-epochs',  type=int,   help="FREEZE_EPOCHS override")
+    parser.add_argument('--mixup-alpha',    type=float, help="MIXUP_ALPHA override")
+    parser.add_argument('--augment',        action='store_true', default=None, help="Enable AUGMENT")
+    parser.add_argument('--no-augment',     action='store_true', help="Disable AUGMENT")
+    parser.add_argument('--no-soundscapes', action='store_true', help="Disable USE_TRAIN_SOUNDSCAPES")
+    parser.add_argument('--output-dir',     type=str,   help="OUTPUT_DIR override")
+    args = parser.parse_args()
+
+    with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+
+    # Apply CLI overrides (only if explicitly provided)
+    if args.backbone:       config['BACKBONE']               = args.backbone
+    if args.epochs:         config['MAX_EPOCHS']             = args.epochs
+    if args.lr:             config['LEARNING_RATE']          = args.lr
+    if args.batch_size:     config['BATCH_SIZE']             = args.batch_size
+    if args.loss:           config['LOSS']                   = args.loss
+    if args.freeze_epochs is not None: config['FREEZE_EPOCHS'] = args.freeze_epochs
+    if args.mixup_alpha is not None:   config['MIXUP_ALPHA']   = args.mixup_alpha
+    if args.augment:        config['AUGMENT']                = True
+    if args.no_augment:     config['AUGMENT']                = False
+    if args.no_soundscapes: config['USE_TRAIN_SOUNDSCAPES']  = False
+    if args.output_dir:     config['OUTPUT_DIR']             = args.output_dir
 
     device = torch.device('cpu')
     if torch.cuda.is_available():
@@ -260,39 +332,104 @@ def main():
         json.dump(label_list, f)
     print(f"Label list saved → {label_list_path}")
 
-    # Train / val split
-    val_frac = config.get('VAL_SPLIT', 0.0)
+    # ---------------------------------------------------------------------------
+    # Data splitting strategy
+    #
+    # VAL_FROM_SOUNDSCAPES (recommended):
+    #   Val = subset of labeled train_soundscapes (same domain as test)
+    #   → Val AUC is a realistic proxy for leaderboard score
+    #
+    # VAL_SPLIT (fallback):
+    #   Val = subset of train_audio (different domain from test)
+    #   → Val AUC tends to be inflated (~0.94 vs real ~0.74)
+    # ---------------------------------------------------------------------------
     seed = config.get('VAL_SEED', 42)
+    soundscape_train_df = None   # train portion of soundscapes (after split)
+    val_loader = None
 
-    if val_frac > 0:
-        # Stratify by primary_label, but classes with <2 samples can't be stratified.
-        # Replace singleton classes with "__rare__" so sklearn doesn't crash.
-        counts = train_df['primary_label'].value_counts()
-        stratify_col = train_df['primary_label'].where(
-            train_df['primary_label'].map(counts) >= 2, other='__rare__'
-        )
-        train_idx, val_idx = train_test_split(
-            range(len(train_df)),
-            test_size=val_frac,
-            stratify=stratify_col,
-            random_state=seed,
-        )
-        train_df_split = train_df.iloc[train_idx].reset_index(drop=True)
-        val_df_split = train_df.iloc[val_idx].reset_index(drop=True)
+    soundscape_labels_csv = config.get('TRAIN_SOUNDSCAPES_LABELS', '')
+    use_soundscapes = config.get('USE_TRAIN_SOUNDSCAPES', False)
+    val_from_soundscapes = config.get('VAL_FROM_SOUNDSCAPES', False)
 
-        train_split_path = os.path.join(config['OUTPUT_DIR'], 'train_split.csv')
-        val_split_path = os.path.join(config['OUTPUT_DIR'], 'val_split.csv')
-        train_df_split.to_csv(train_split_path, index=False)
-        val_df_split.to_csv(val_split_path, index=False)
-        print(f"Train: {len(train_df_split)} | Val: {len(val_df_split)}")
+    if val_from_soundscapes and use_soundscapes and soundscape_labels_csv and os.path.exists(soundscape_labels_csv):
+        # Split soundscapes by filename to avoid leakage
+        val_sc_frac = config.get('VAL_SOUNDSCAPE_FRAC', 0.15)
+        soundscape_train_df, soundscape_val_df = split_soundscapes_by_file(
+            soundscape_labels_csv, val_frac=val_sc_frac, seed=seed
+        )
+        # Save split CSVs for reproducibility
+        sc_val_path = os.path.join(config['OUTPUT_DIR'], 'soundscape_val_split.csv')
+        sc_train_path = os.path.join(config['OUTPUT_DIR'], 'soundscape_train_split.csv')
+        soundscape_val_df.to_csv(sc_val_path, index=False)
+        soundscape_train_df.to_csv(sc_train_path, index=False)
+
+        val_dataset = TrainSoundscapesDataset(
+            soundscape_dir=config['TRAIN_SOUNDSCAPES_DIR'],
+            labels_csv=sc_val_path,
+            transform=val_transform,
+            label_list=label_list,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config['BATCH_SIZE'],
+            shuffle=False,
+            num_workers=config['NUM_WORKERS'],
+            pin_memory=True,
+        )
+        print(f"Val strategy: soundscapes (domain-matched) | {len(val_dataset)} samples from {len(soundscape_val_df['filename'].unique())} files")
+        print(f"Train soundscapes: {len(soundscape_train_df)} samples")
+
     else:
+        # Fallback: split train_audio by row (stratified by species)
+        val_frac = config.get('VAL_SPLIT', 0.0)
+        if val_frac > 0:
+            counts = train_df['primary_label'].value_counts()
+            stratify_col = train_df['primary_label'].where(
+                train_df['primary_label'].map(counts) >= 2, other='__rare__'
+            )
+            train_idx, val_idx = train_test_split(
+                range(len(train_df)),
+                test_size=val_frac,
+                stratify=stratify_col,
+                random_state=seed,
+            )
+            train_df_split = train_df.iloc[train_idx].reset_index(drop=True)
+            val_df_split   = train_df.iloc[val_idx].reset_index(drop=True)
+            train_split_path = os.path.join(config['OUTPUT_DIR'], 'train_split.csv')
+            val_split_path   = os.path.join(config['OUTPUT_DIR'], 'val_split.csv')
+            train_df_split.to_csv(train_split_path, index=False)
+            val_df_split.to_csv(val_split_path, index=False)
+            print(f"Val strategy: train_audio split (inflated AUC expected) | {len(val_df_split)} samples")
+
+            val_dataset = TrainAudioDataset(
+                csv_path=val_split_path,
+                transform=val_transform,
+                audio_dir=config['TRAIN_AUDIO_DIR'],
+                label_list=label_list,
+                use_secondary_labels=config.get('USE_SECONDARY_LABELS', False),
+                secondary_label_weight=config.get('SECONDARY_LABEL_WEIGHT', 0.5),
+                duration=config.get('DURATION', 5.0),
+                sample_rate=config.get('SAMPLE_RATE', 32000),
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=config['BATCH_SIZE'],
+                shuffle=False,
+                num_workers=config['NUM_WORKERS'],
+                pin_memory=True,
+            )
+        else:
+            train_split_path = config['TRAIN_CSV']
+            print("No validation split configured.")
+
+    # Use the full train.csv for audio if no audio-based split happened
+    if 'train_split_path' not in locals():
         train_split_path = config['TRAIN_CSV']
-        val_split_path = None
-        print(f"Train: {len(train_df)} | No validation split")
 
     print("Building training dataset...")
     train_dataset, sample_weights = build_combined_dataset(
-        config, train_split_path, label_list, train_transform
+        config, train_split_path, label_list, train_transform,
+        soundscape_train_df=soundscape_train_df,
     )
     print(f"  Total train samples: {len(train_dataset)}")
 
@@ -324,41 +461,42 @@ def main():
             pin_memory=True,
         )
 
-    val_loader = None
-    if val_split_path:
-        val_dataset = TrainAudioDataset(
-            csv_path=val_split_path,
-            transform=val_transform,
-            audio_dir=config['TRAIN_AUDIO_DIR'],
-            label_list=label_list,
-            use_secondary_labels=config.get('USE_SECONDARY_LABELS', False),
-            secondary_label_weight=config.get('SECONDARY_LABEL_WEIGHT', 0.5),
-            duration=config.get('DURATION', 5.0),
-            sample_rate=config.get('SAMPLE_RATE', 32000),
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=config['BATCH_SIZE'],
-            shuffle=False,
-            num_workers=config['NUM_WORKERS'],
-            pin_memory=True,
-        )
-        print(f"  Total val samples: {len(val_dataset)}")
-
     model = get_model(
         num_classes=num_classes,
         backbone=config.get('BACKBONE', 'simple_cnn'),
         device=device,
     )
 
-    criterion = nn.BCEWithLogitsLoss()
+    loss_name = config.get('LOSS', 'bce').lower()
+    if loss_name == 'focal_bce':
+        gamma = config.get('FOCAL_GAMMA', 2.0)
+        criterion = lambda logits, targets: focal_bce_with_logits(logits, targets, gamma=gamma)
+    else:
+        criterion = nn.BCEWithLogitsLoss()
     optimizer = build_optimizer(model, config)
     scheduler = build_scheduler(optimizer, config)
 
     best_auc = 0.0
+    freeze_epochs = config.get('FREEZE_EPOCHS', 0)
+
+    # Freeze backbone for the first FREEZE_EPOCHS epochs if configured.
+    # Only applies to BirdClassifier (EfficientNet/ResNet), not SimpleCNN.
+    def set_backbone_freeze(model, frozen: bool):
+        if hasattr(model, 'backbone'):
+            for param in model.backbone.parameters():
+                param.requires_grad = not frozen
+            status = "frozen" if frozen else "unfrozen"
+            print(f"  Backbone {status}.")
+
+    if freeze_epochs > 0:
+        set_backbone_freeze(model, frozen=True)
 
     for epoch in range(config['MAX_EPOCHS']):
         print(f"\nEpoch {epoch + 1}/{config['MAX_EPOCHS']}")
+
+        # Unfreeze backbone after FREEZE_EPOCHS
+        if freeze_epochs > 0 and epoch == freeze_epochs:
+            set_backbone_freeze(model, frozen=False)
 
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device,

@@ -9,3 +9,5 @@ pyyaml
 scikit-learn
 onnx
 onnxruntime
+soundfile
+# tensorflow  # optional, needed only for extract_perch.py (Perch embedding extraction)

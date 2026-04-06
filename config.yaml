@@ -42,6 +42,8 @@ SCHEDULER: "cosine"
 # Validation
 VAL_SPLIT: 0.1
 VAL_SEED: 42
+VAL_FROM_SOUNDSCAPES: false  # true = val dari soundscapes (domain-matched, realistis)
+VAL_SOUNDSCAPE_FRAC: 0.15    # 15% soundscape files untuk val
 SAVE_BEST_MODEL: true
 
 # Labels
@@ -76,3 +78,38 @@ ONNX_OPSET: 17
 ONNX_MODEL_PATH: "output/model.onnx"
 ONNX_NUM_THREADS: 4
 INFERENCE_BATCH_SIZE: 64
+
+# Backbone freezing (gradual unfreezing)
+FREEZE_EPOCHS: 0             # 0 = no freezing, 3 = freeze backbone for first 3 epochs
+
+# Loss function
+LOSS: "bce"              # "bce" or "focal_bce"
+FOCAL_GAMMA: 2.0         # only used when LOSS: "focal_bce"
+
+# Perch embedding extraction
+PERCH:
+  MODEL_DIR: ""                        # path to Perch TF SavedModel
+  CACHE_DIR: "output/perch_cache"
+  BATCH_FILES: 16
+  WINDOW_SEC: 5
+  N_WINDOWS: 12
+
+# ProtoSSM training
+SSM:
+  D_MODEL: 320
+  D_STATE: 32
+  N_SSM_LAYERS: 4
+  DROPOUT: 0.12
+  USE_CROSS_ATTN: true
+  CROSS_ATTN_HEADS: 8
+  N_EPOCHS: 80
+  LR: 0.0008
+  WEIGHT_DECAY: 0.001
+  PATIENCE: 20
+  POS_WEIGHT_CAP: 25.0
+  DISTILL_WEIGHT: 0.15
+  LABEL_SMOOTHING: 0.03
+  FOCAL_GAMMA: 2.5
+  SWA_START_FRAC: 0.65
+  SWA_LR: 0.0004
+  RESIDUAL_WEIGHT: 0.35
