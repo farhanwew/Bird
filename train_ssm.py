@@ -284,6 +284,7 @@ def train_mlp_probes(
     # PCA + scale
     scaler = StandardScaler()
     emb_scaled = scaler.fit_transform(emb_flat)
+    n_pca = min(n_pca, emb_scaled.shape[0], emb_scaled.shape[1])
     pca = PCA(n_components=n_pca, random_state=42)
     emb_pca = pca.fit_transform(emb_scaled)    # (N*T, n_pca)
 
