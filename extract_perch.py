@@ -296,30 +296,46 @@ class PerchExtractor:
                         tqdm.write(f"  SKIP (load) {os.path.basename(path)}: {e}")
 
                 if windows_list:
+                    batch_ok = False
                     try:
                         stacked = np.vstack(windows_list)          # (N_files*12, samples)
                         emb_all, logit_all = self._infer_batch(stacked)
+                        batch_ok = True
                     except Exception as e:
-                        skipped += len(windows_list)
-                        tqdm.write(f"  SKIP batch of {len(windows_list)} files: {e}")
-                        i += len(chunk)
-                        pbar.update(len(chunk))
-                        pbar.set_postfix(skipped=skipped, windows=len(all_row_ids))
-                        continue
+                        tqdm.write(f"  Batch failed ({type(e).__name__}), falling back to per-file...")
 
-                    for j, (path, meta) in enumerate(metas):
-                        fname = os.path.basename(path)
-                        stem = os.path.splitext(fname)[0]
-                        emb = emb_all[j * self.n_windows: (j + 1) * self.n_windows]
-                        raw_logits = logit_all[j * self.n_windows: (j + 1) * self.n_windows]
-                        comp_scores = _map_logits(raw_logits, perch_to_comp, n_comp)
-                        for t in range(self.n_windows):
-                            all_row_ids.append(f"{stem}_{(t + 1) * self.window_sec}")
-                            all_filenames.append(fname)
-                            all_sites.append(meta['site'])
-                            all_hours.append(meta['hour_utc'])
-                        all_emb.append(emb)
-                        all_scores.append(comp_scores)
+                    if batch_ok:
+                        for j, (path, meta) in enumerate(metas):
+                            fname = os.path.basename(path)
+                            stem = os.path.splitext(fname)[0]
+                            emb = emb_all[j * self.n_windows: (j + 1) * self.n_windows]
+                            raw_logits = logit_all[j * self.n_windows: (j + 1) * self.n_windows]
+                            comp_scores = _map_logits(raw_logits, perch_to_comp, n_comp)
+                            for t in range(self.n_windows):
+                                all_row_ids.append(f"{stem}_{(t + 1) * self.window_sec}")
+                                all_filenames.append(fname)
+                                all_sites.append(meta['site'])
+                                all_hours.append(meta['hour_utc'])
+                            all_emb.append(emb)
+                            all_scores.append(comp_scores)
+                    else:
+                        # Fallback: per-file inference (slower but more robust)
+                        for path, meta in metas:
+                            fname = os.path.basename(path)
+                            stem = os.path.splitext(fname)[0]
+                            try:
+                                emb, raw_logits = self.extract_file(path)
+                                comp_scores = _map_logits(raw_logits, perch_to_comp, n_comp)
+                                for t in range(self.n_windows):
+                                    all_row_ids.append(f"{stem}_{(t + 1) * self.window_sec}")
+                                    all_filenames.append(fname)
+                                    all_sites.append(meta['site'])
+                                    all_hours.append(meta['hour_utc'])
+                                all_emb.append(emb)
+                                all_scores.append(comp_scores)
+                            except Exception as e2:
+                                skipped += 1
+                                tqdm.write(f"  SKIP {fname}: {e2}")
 
                 i += len(chunk)
                 pbar.update(len(chunk))
