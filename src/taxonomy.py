@@ -107,7 +107,13 @@ class TaxonomyManager:
         label_lookup: Dict[Tuple, np.ndarray] = {}
         for _, row in labels_df.iterrows():
             fname = os.path.splitext(os.path.basename(str(row['filename'])))[0]
-            end_sec = int(row['end'])
+            raw_end = str(row['end']).strip()
+            if ':' in raw_end:
+                # HH:MM:SS or MM:SS format
+                parts = raw_end.split(':')
+                end_sec = sum(int(p) * 60 ** (len(parts) - 1 - i) for i, p in enumerate(parts))
+            else:
+                end_sec = int(float(raw_end))
             vec = np.zeros(self.n_classes, dtype=np.float32)
             species_list = str(row['primary_label']).split(';')
             for sp in species_list:
