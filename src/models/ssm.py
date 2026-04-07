@@ -267,7 +267,7 @@ class ProtoSSMv5(nn.Module):
         proto_logits = sim * temp.unsqueeze(0).unsqueeze(0)
 
         # Gated fusion with Perch base logits
-        if perch_logits is not None:
+        if perch_logits is not None and perch_logits.shape[-1] == self.n_classes:
             alpha = torch.sigmoid(self.fusion_alpha)
             species_logits = alpha * proto_logits + (1 - alpha) * perch_logits
         else:

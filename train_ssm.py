@@ -476,6 +476,16 @@ def main():
     emb_flat = np.vstack(emb_list).astype(np.float32)
     scores_flat = np.vstack(scores_list).astype(np.float32)
     meta_df = pd.concat(meta_list, ignore_index=True)
+
+    # Align scores columns to label_list (cache may have been extracted with different n_classes)
+    if scores_flat.shape[1] != n_classes:
+        print(f"Warning: scores cache has {scores_flat.shape[1]} classes, label_list has {n_classes}. Truncating/padding.")
+        if scores_flat.shape[1] > n_classes:
+            scores_flat = scores_flat[:, :n_classes]
+        else:
+            pad = np.full((scores_flat.shape[0], n_classes - scores_flat.shape[1]), -8.0, dtype=np.float32)
+            scores_flat = np.concatenate([scores_flat, pad], axis=1)
+
     print(f"Total windows: {len(emb_flat)}")
 
     # Build site/hour metadata
